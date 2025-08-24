@@ -1,4 +1,4 @@
-module golang.zx2c4.com/wireguard
+module github.com/jclab-oss/wireguard-protocol
 
 go 1.23.1
 
@@ -13,4 +13,5 @@ require (
 require (
 	github.com/google/btree v1.1.2 // indirect
 	golang.org/x/time v0.7.0 // indirect
+	golang.zx2c4.com/wireguard v0.0.0-20250521234502-f333402bd9cb // indirect
 )

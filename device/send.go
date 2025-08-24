@@ -14,7 +14,6 @@ import (
 
 	"golang.org/x/crypto/chacha20poly1305"
 	"golang.zx2c4.com/wireguard/conn"
-	"golang.zx2c4.com/wireguard/tun"
 )
 
 /* Outbound flow
@@ -289,7 +288,7 @@ func (device *Device) RoutineReadFromTUN() {
 		}
 
 		if readErr != nil {
-			if errors.Is(readErr, tun.ErrTooManySegments) {
+			if errors.Is(readErr, ErrTooManySegments) {
 				// TODO: record stat for this
 				// This will happen if MSS is surprisingly small (< 576)
 				// coincident with reasonably high throughput.

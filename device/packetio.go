@@ -8,9 +8,9 @@ package device
 type PacketIOEvent int
 
 const (
-	PacketIOUp PacketIOEvent = 1 << iota
-	PacketIODown
-	PacketIOMTUUpdate
+	PacketIOEventUp PacketIOEvent = 1 << iota
+	PacketIOEventDown
+	PacketIOEventMTUUpdate
 )
 
 type PacketIO interface {

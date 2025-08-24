@@ -31,7 +31,7 @@ func newTestPacketIO() *testPacketIO {
 		closed:   make(chan struct{}),
 		events:   make(chan PacketIOEvent, 1),
 	}
-	c.events <- PacketIOUp
+	c.events <- PacketIOEventUp
 	return c
 }
 
