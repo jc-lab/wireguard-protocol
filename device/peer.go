@@ -8,6 +8,7 @@ package device
 import (
 	"container/list"
 	"errors"
+	"net/netip"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -24,6 +25,11 @@ type Peer struct {
 	txBytes           atomic.Uint64  // bytes send to peer (endpoint)
 	rxBytes           atomic.Uint64  // bytes received from peer
 	lastHandshakeNano atomic.Int64   // nano seconds since epoch
+
+	// allowedPrefixes holds prefixes configured via UAPI allowed_ip.
+	// Access must be protected by allowedMu when concurrently read by outboundSelector.
+	allowedMu       sync.RWMutex
+	allowedPrefixes []netip.Prefix
 
 	endpoint struct {
 		sync.Mutex
@@ -133,6 +139,11 @@ func (peer *Peer) SendBuffers(buffers [][]byte) error {
 	}
 	peer.endpoint.Unlock()
 
+	// Debug: log send attempt
+	if peer.device.log != nil {
+		peer.device.log.Verbosef("%v - Sending %d buffers to endpoint %v", peer, len(buffers), endpoint)
+	}
+
 	err := peer.device.net.bind.Send(buffers, endpoint)
 	if err == nil {
 		var totalLen uint64
@@ -140,6 +151,13 @@ func (peer *Peer) SendBuffers(buffers [][]byte) error {
 			totalLen += uint64(len(b))
 		}
 		peer.txBytes.Add(totalLen)
+		if peer.device.log != nil {
+			peer.device.log.Verbosef("%v - Sent %d bytes to %v", peer, totalLen, endpoint)
+		}
+	} else {
+		if peer.device.log != nil {
+			peer.device.log.Verbosef("%v - Failed to send buffers to %v: %v", peer, endpoint, err)
+		}
 	}
 	return err
 }
