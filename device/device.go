@@ -14,7 +14,6 @@ import (
 	"golang.zx2c4.com/wireguard/conn"
 	"golang.zx2c4.com/wireguard/ratelimiter"
 	"golang.zx2c4.com/wireguard/rwcancel"
-	"golang.zx2c4.com/wireguard/tun"
 )
 
 type Device struct {
@@ -63,7 +62,6 @@ type Device struct {
 		limiter        ratelimiter.Ratelimiter
 	}
 
-	allowedips    AllowedIPs
 	indexTable    IndexTable
 	cookieChecker CookieChecker
 
@@ -82,7 +80,7 @@ type Device struct {
 	}
 
 	tun struct {
-		device tun.Device
+		device PacketIO
 		mtu    atomic.Int32
 	}
 
@@ -127,8 +125,6 @@ func (device *Device) isUp() bool {
 
 // Must hold device.peers.Lock()
 func removePeerLocked(device *Device, peer *Peer, key NoisePublicKey) {
-	// stop routing and processing of packets
-	device.allowedips.RemoveByPeer(peer)
 	peer.Stop()
 
 	// remove from peer map
@@ -281,17 +277,20 @@ func (device *Device) SetPrivateKey(sk NoisePrivateKey) error {
 	return nil
 }
 
-func NewDevice(tunDevice tun.Device, bind conn.Bind, logger *Logger) *Device {
+func NewDevice(packetio PacketIO, bind conn.Bind, logger *Logger) *Device {
 	device := new(Device)
 	device.state.state.Store(uint32(deviceStateDown))
 	device.closed = make(chan struct{})
 	device.log = logger
 	device.net.bind = bind
-	device.tun.device = tunDevice
-	mtu, err := device.tun.device.MTU()
-	if err != nil {
-		device.log.Errorf("Trouble determining MTU, assuming default: %v", err)
-		mtu = DefaultMTU
+	device.tun.device = packetio
+	mtu := DefaultMTU
+	if device.tun.device != nil {
+		if m, err := device.tun.device.MTU(); err == nil {
+			mtu = m
+		} else {
+			device.log.Errorf("Trouble determining MTU, assuming default: %v", err)
+		}
 	}
 	device.tun.mtu.Store(int32(mtu))
 	device.peers.keyMap = make(map[NoisePublicKey]*Peer)

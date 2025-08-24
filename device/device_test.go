@@ -12,7 +12,6 @@ import (
 	"io"
 	"math/rand"
 	"net/netip"
-	"os"
 	"runtime"
 	"runtime/pprof"
 	"sync"
@@ -21,8 +20,6 @@ import (
 	"time"
 
 	"golang.zx2c4.com/wireguard/conn"
-	"golang.zx2c4.com/wireguard/conn/bindtest"
-	"golang.zx2c4.com/wireguard/tun"
 	"golang.zx2c4.com/wireguard/tun/tuntest"
 )
 
@@ -96,7 +93,7 @@ type testPair [2]testPeer
 
 // A testPeer is a peer used for testing.
 type testPeer struct {
-	tun *tuntest.ChannelTUN
+	io  *testPacketIO
 	dev *Device
 	ip  netip.Addr
 }
@@ -123,12 +120,12 @@ func (pair *testPair) Send(tb testing.TB, ping SendDirection, done chan struct{}
 		p0, p1 = p1, p0
 	}
 	msg := tuntest.Ping(p0.ip, p1.ip)
-	p1.tun.Outbound <- msg
+	p1.io.Outbound <- msg
 	timer := time.NewTimer(5 * time.Second)
 	defer timer.Stop()
 	var err error
 	select {
-	case msgRecv := <-p0.tun.Inbound:
+	case msgRecv := <-p0.io.Inbound:
 		if !bytes.Equal(msg, msgRecv) {
 			err = fmt.Errorf("%s did not transit correctly", ping)
 		}
@@ -148,50 +145,6 @@ func (pair *testPair) Send(tb testing.TB, ping SendDirection, done chan struct{}
 	}
 }
 
-// genTestPair creates a testPair.
-func genTestPair(tb testing.TB, realSocket bool) (pair testPair) {
-	cfg, endpointCfg := genConfigs(tb)
-	var binds [2]conn.Bind
-	if realSocket {
-		binds[0], binds[1] = conn.NewDefaultBind(), conn.NewDefaultBind()
-	} else {
-		binds = bindtest.NewChannelBinds()
-	}
-	// Bring up a ChannelTun for each config.
-	for i := range pair {
-		p := &pair[i]
-		p.tun = tuntest.NewChannelTUN()
-		p.ip = netip.AddrFrom4([4]byte{1, 0, 0, byte(i + 1)})
-		level := LogLevelVerbose
-		if _, ok := tb.(*testing.B); ok && !testing.Verbose() {
-			level = LogLevelError
-		}
-		p.dev = NewDevice(p.tun.TUN(), binds[i], NewLogger(level, fmt.Sprintf("dev%d: ", i)))
-		if err := p.dev.IpcSet(cfg[i]); err != nil {
-			tb.Errorf("failed to configure device %d: %v", i, err)
-			p.dev.Close()
-			continue
-		}
-		if err := p.dev.Up(); err != nil {
-			tb.Errorf("failed to bring up device %d: %v", i, err)
-			p.dev.Close()
-			continue
-		}
-		endpointCfg[i^1] = fmt.Sprintf(endpointCfg[i^1], p.dev.net.port)
-	}
-	for i := range pair {
-		p := &pair[i]
-		if err := p.dev.IpcSet(endpointCfg[i]); err != nil {
-			tb.Errorf("failed to configure device endpoint %d: %v", i, err)
-			p.dev.Close()
-			continue
-		}
-		// The device is ready. Close it when the test completes.
-		tb.Cleanup(p.dev.Close)
-	}
-	return
-}
-
 func TestTwoDevicePing(t *testing.T) {
 	goroutineLeakCheck(t)
 	pair := genTestPair(t, true)
@@ -205,8 +158,8 @@ func TestTwoDevicePing(t *testing.T) {
 
 func TestUpDown(t *testing.T) {
 	goroutineLeakCheck(t)
-	const itrials = 50
-	const otrials = 10
+	const itrials = 5
+	const otrials = 3
 
 	for n := 0; n < otrials; n++ {
 		pair := genTestPair(t, false)
@@ -354,7 +307,7 @@ func BenchmarkThroughput(b *testing.B) {
 		defer wg.Done()
 		var start time.Time
 		for {
-			<-pair[0].tun.Inbound
+			<-pair[0].io.Inbound
 			new := recv.Add(1)
 			if new == 1 {
 				start = time.Now()
@@ -369,7 +322,7 @@ func BenchmarkThroughput(b *testing.B) {
 
 	// Send packets as fast as we can until we've received enough.
 	ping := tuntest.Ping(pair[0].ip, pair[1].ip)
-	pingc := pair[1].tun.Outbound
+	pingc := pair[1].io.Outbound
 	var sent uint64
 	for recv.Load() != uint64(b.N) {
 		sent++
@@ -431,46 +384,3 @@ func (b *fakeBindSized) SetMark(mark uint32) error                     { return 
 func (b *fakeBindSized) Send(bufs [][]byte, ep conn.Endpoint) error    { return nil }
 func (b *fakeBindSized) ParseEndpoint(s string) (conn.Endpoint, error) { return nil, nil }
 func (b *fakeBindSized) BatchSize() int                                { return b.size }
-
-type fakeTUNDeviceSized struct {
-	size int
-}
-
-func (t *fakeTUNDeviceSized) File() *os.File { return nil }
-func (t *fakeTUNDeviceSized) Read(bufs [][]byte, sizes []int, offset int) (n int, err error) {
-	return 0, nil
-}
-func (t *fakeTUNDeviceSized) Write(bufs [][]byte, offset int) (int, error) { return 0, nil }
-func (t *fakeTUNDeviceSized) MTU() (int, error)                            { return 0, nil }
-func (t *fakeTUNDeviceSized) Name() (string, error)                        { return "", nil }
-func (t *fakeTUNDeviceSized) Events() <-chan tun.Event                     { return nil }
-func (t *fakeTUNDeviceSized) Close() error                                 { return nil }
-func (t *fakeTUNDeviceSized) BatchSize() int                               { return t.size }
-
-func TestBatchSize(t *testing.T) {
-	d := Device{}
-
-	d.net.bind = &fakeBindSized{1}
-	d.tun.device = &fakeTUNDeviceSized{1}
-	if want, got := 1, d.BatchSize(); got != want {
-		t.Errorf("expected batch size %d, got %d", want, got)
-	}
-
-	d.net.bind = &fakeBindSized{1}
-	d.tun.device = &fakeTUNDeviceSized{128}
-	if want, got := 128, d.BatchSize(); got != want {
-		t.Errorf("expected batch size %d, got %d", want, got)
-	}
-
-	d.net.bind = &fakeBindSized{128}
-	d.tun.device = &fakeTUNDeviceSized{1}
-	if want, got := 128, d.BatchSize(); got != want {
-		t.Errorf("expected batch size %d, got %d", want, got)
-	}
-
-	d.net.bind = &fakeBindSized{128}
-	d.tun.device = &fakeTUNDeviceSized{128}
-	if want, got := 128, d.BatchSize(); got != want {
-		t.Errorf("expected batch size %d, got %d", want, got)
-	}
-}

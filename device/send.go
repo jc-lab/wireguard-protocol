@@ -8,16 +8,12 @@ package device
 import (
 	"encoding/binary"
 	"errors"
-	"net"
 	"os"
 	"sync"
 	"time"
 
 	"golang.org/x/crypto/chacha20poly1305"
-	"golang.org/x/net/ipv4"
-	"golang.org/x/net/ipv6"
 	"golang.zx2c4.com/wireguard/conn"
-	"golang.zx2c4.com/wireguard/tun"
 )
 
 /* Outbound flow
@@ -45,16 +41,22 @@ import (
  */
 
 type QueueOutboundElement struct {
-	buffer  *[MaxMessageSize]byte // slice holding the packet data
-	packet  []byte                // slice of "buffer" (always!)
-	nonce   uint64                // nonce for encryption
-	keypair *Keypair              // keypair for encryption
-	peer    *Peer                 // related peer
+	buffer  *MessageBuffer // slice holding the packet data
+	packet  []byte         // slice of "buffer" (always!)
+	nonce   uint64         // nonce for encryption
+	keypair *Keypair       // keypair for encryption
+	peer    *Peer          // related peer
 }
 
 type QueueOutboundElementsContainer struct {
 	sync.Mutex
 	elems []*QueueOutboundElement
+}
+
+type OutboundContainer struct {
+	Broadcast bool
+	Buf       *MessageBuffer
+	Peers     []NoisePublicKey
 }
 
 func (device *Device) NewOutboundElement() *QueueOutboundElement {
@@ -215,89 +217,78 @@ func (device *Device) RoutineReadFromTUN() {
 	var (
 		batchSize   = device.BatchSize()
 		readErr     error
-		elems       = make([]*QueueOutboundElement, batchSize)
-		bufs        = make([][]byte, batchSize)
+		containers  = make([]OutboundContainer, batchSize)
 		elemsByPeer = make(map[*Peer]*QueueOutboundElementsContainer, batchSize)
 		count       = 0
-		sizes       = make([]int, batchSize)
 		offset      = MessageTransportHeaderSize
 	)
 
-	for i := range elems {
-		elems[i] = device.NewOutboundElement()
-		bufs[i] = elems[i].buffer[:]
+	messageBufferFactory := func() *MessageBuffer {
+		buf := device.GetMessageBuffer()
+		buf.offset = offset
+		return buf
 	}
 
-	defer func() {
-		for _, elem := range elems {
-			if elem != nil {
-				device.PutMessageBuffer(elem.buffer)
-				device.PutOutboundElement(elem)
-			}
-		}
-	}()
-
 	for {
-		// read packets
-		count, readErr = device.tun.device.Read(bufs, sizes, offset)
-		for i := 0; i < count; i++ {
-			if sizes[i] < 1 {
-				continue
-			}
+		count, readErr = device.tun.device.Read(containers, messageBufferFactory)
+		i := 0
+		for ; i < count; i++ {
+			c := containers[i]
+			if c.Broadcast {
+				device.peers.RLock()
+				for _, peer := range device.peers.keyMap {
+					elem := device.NewOutboundElement()
+					elem.peer = peer
+					elem.buffer = c.Buf.Retain()
+					elem.packet = elem.buffer.View()[:elem.buffer.Len()]
 
-			elem := elems[i]
-			elem.packet = bufs[i][offset : offset+sizes[i]]
-
-			// lookup peer
-			var peer *Peer
-			switch elem.packet[0] >> 4 {
-			case 4:
-				if len(elem.packet) < ipv4.HeaderLen {
-					continue
+					elemsForPeer, ok := elemsByPeer[peer]
+					if !ok {
+						elemsForPeer = device.GetOutboundElementsContainer()
+						elemsByPeer[peer] = elemsForPeer
+					}
+					elemsForPeer.elems = append(elemsForPeer.elems, elem)
 				}
-				dst := elem.packet[IPv4offsetDst : IPv4offsetDst+net.IPv4len]
-				peer = device.allowedips.Lookup(dst)
+				device.peers.RUnlock()
+			} else {
+				for _, key := range c.Peers {
+					peer := device.LookupPeer(key)
+					if peer == nil {
+						continue
+					}
 
-			case 6:
-				if len(elem.packet) < ipv6.HeaderLen {
-					continue
+					elem := device.NewOutboundElement()
+					elem.peer = peer
+					elem.buffer = c.Buf.Retain()
+					elem.packet = elem.buffer.View()[:elem.buffer.Len()]
+
+					elemsForPeer, ok := elemsByPeer[elem.peer]
+					if !ok {
+						elemsForPeer = device.GetOutboundElementsContainer()
+						elemsByPeer[elem.peer] = elemsForPeer
+					}
+					elemsForPeer.elems = append(elemsForPeer.elems, elem)
 				}
-				dst := elem.packet[IPv6offsetDst : IPv6offsetDst+net.IPv6len]
-				peer = device.allowedips.Lookup(dst)
-
-			default:
-				device.log.Verbosef("Received packet with unknown IP version")
 			}
-
-			if peer == nil {
-				continue
-			}
-			elemsForPeer, ok := elemsByPeer[peer]
-			if !ok {
-				elemsForPeer = device.GetOutboundElementsContainer()
-				elemsByPeer[peer] = elemsForPeer
-			}
-			elemsForPeer.elems = append(elemsForPeer.elems, elem)
-			elems[i] = device.NewOutboundElement()
-			bufs[i] = elems[i].buffer[:]
+			device.PutMessageBuffer(c.Buf)
+		}
+		for ; i < len(containers); i++ {
+			c := containers[i]
+			c.Buf = nil
+			c.Peers = nil
+			c.Broadcast = false
 		}
 
 		for peer, elemsForPeer := range elemsByPeer {
-			if peer.isRunning.Load() {
-				peer.StagePackets(elemsForPeer)
-				peer.SendStagedPackets()
-			} else {
-				for _, elem := range elemsForPeer.elems {
-					device.PutMessageBuffer(elem.buffer)
-					device.PutOutboundElement(elem)
-				}
-				device.PutOutboundElementsContainer(elemsForPeer)
-			}
+			// Always stage packets for the peer. Do not drop based on isRunning.
+			// SendStagedPackets will initiate handshakes if keypairs are missing.
+			peer.StagePackets(elemsForPeer)
+			peer.SendStagedPackets()
 			delete(elemsByPeer, peer)
 		}
 
 		if readErr != nil {
-			if errors.Is(readErr, tun.ErrTooManySegments) {
+			if errors.Is(readErr, ErrTooManySegments) {
 				// TODO: record stat for this
 				// This will happen if MSS is surprisingly small (< 576)
 				// coincident with reasonably high throughput.
@@ -342,8 +333,23 @@ top:
 
 	keypair := peer.keypairs.Current()
 	if keypair == nil || keypair.sendNonce.Load() >= RejectAfterMessages || time.Since(keypair.created) >= RejectAfterTime {
+		// Trigger handshake if no keypair or expired. Do not drop staged packets:
+		// wait briefly for keypair to become available so staged packets can be sent.
 		peer.SendHandshakeInitiation(false)
-		return
+
+		// Wait up to 1s for a new keypair to -appear, polling briefly.
+		waitTimeout := time.Now().Add(time.Second)
+		for time.Now().Before(waitTimeout) {
+			time.Sleep(10 * time.Millisecond)
+			keypair = peer.keypairs.Current()
+			if keypair != nil && keypair.sendNonce.Load() < RejectAfterMessages && time.Since(keypair.created) < RejectAfterTime {
+				break
+			}
+		}
+		// If still no usable keypair, return and leave staged packets queued.
+		if keypair == nil || keypair.sendNonce.Load() >= RejectAfterMessages || time.Since(keypair.created) >= RejectAfterTime {
+			return
+		}
 	}
 
 	for {
@@ -446,11 +452,16 @@ func (device *Device) RoutineEncryption(id int) {
 	for elemsContainer := range device.queue.encryption.c {
 		for _, elem := range elemsContainer.elems {
 			// populate header fields
-			header := elem.buffer[:MessageTransportHeaderSize]
+			header := elem.buffer.data[:MessageTransportHeaderSize]
 
 			fieldType := header[0:4]
 			fieldReceiver := header[4:8]
 			fieldNonce := header[8:16]
+
+			// Debug: log encryption candidate
+			if device.log != nil && elem.peer != nil {
+				device.log.Verbosef("Encrypt worker %d: peer=%v nonce=%d pktlen=%d", id, elem.peer, elem.nonce, len(elem.packet))
+			}
 
 			binary.LittleEndian.PutUint32(fieldType, MessageTransportType)
 			binary.LittleEndian.PutUint32(fieldReceiver, elem.keypair.remoteIndex)
@@ -490,7 +501,7 @@ func (peer *Peer) RoutineSequentialSender(maxBatchSize int) {
 			return
 		}
 		if !peer.isRunning.Load() {
-			// peer has been stopped; return re-usable elems to the shared pool.
+			// peer has been stopped; return re-usable elems to the shared factory.
 			// This is an optimization only. It is possible for the peer to be stopped
 			// immediately after this check, in which case, elem will get processed.
 			// The timers and SendBuffers code are resilient to a few stragglers.
@@ -515,6 +526,15 @@ func (peer *Peer) RoutineSequentialSender(maxBatchSize int) {
 
 		peer.timersAnyAuthenticatedPacketTraversal()
 		peer.timersAnyAuthenticatedPacketSent()
+
+		// compute total length for logging
+		var totalLen uint64
+		for _, b := range bufs {
+			totalLen += uint64(len(b))
+		}
+		if device.log != nil {
+			device.log.Verbosef("%v - SequentialSender: sending %d buffers totalBytes=%d", peer, len(bufs), totalLen)
+		}
 
 		err := peer.SendBuffers(bufs)
 		if dataSent {

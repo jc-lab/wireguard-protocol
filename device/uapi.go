@@ -120,10 +120,9 @@ func (device *Device) IpcGetOperation(w io.Writer) error {
 			sendf("rx_bytes=%d", peer.rxBytes.Load())
 			sendf("persistent_keepalive_interval=%d", peer.persistentKeepaliveInterval.Load())
 
-			device.allowedips.EntriesForPeer(peer, func(prefix netip.Prefix) bool {
-				sendf("allowed_ip=%s", prefix.String())
-				return true
-			})
+			// allowed_ip listing removed in library-mode (raw frame only).
+			// Previously we would list allowed IPs here; this implementation
+			// intentionally omits them to avoid IP-stack dependencies.
 		}
 	}()
 
@@ -361,36 +360,25 @@ func (device *Device) handlePeerLine(peer *ipcSetPeer, key, value string) error 
 		peer.pkaOn = old == 0 && secs != 0
 
 	case "replace_allowed_ips":
-		device.log.Verbosef("%v - UAPI: Removing all allowedips", peer.Peer)
+		// Allowed IPs management is disabled in library-mode.
+		// Accept the operation but perform no changes.
 		if value != "true" {
 			return ipcErrorf(ipc.IpcErrorInvalid, "failed to replace allowedips, invalid value: %v", value)
 		}
-		if peer.dummy {
-			return nil
-		}
-		device.allowedips.RemoveByPeer(peer.Peer)
+		// No-op: do not track allowed IPs in library-mode.
+		return nil
 
 	case "allowed_ip":
-		add := true
-		verb := "Adding"
+		// Allowed IP management is disabled in library-mode.
+		// Accept the command but do not alter any internal routing tables.
 		if len(value) > 0 && value[0] == '-' {
-			add = false
-			verb = "Removing"
 			value = value[1:]
 		}
-		device.log.Verbosef("%v - UAPI: %s allowedip", peer.Peer, verb)
-		prefix, err := netip.ParsePrefix(value)
-		if err != nil {
+		// Validate prefix syntax but otherwise ignore.
+		if _, err := netip.ParsePrefix(value); err != nil {
 			return ipcErrorf(ipc.IpcErrorInvalid, "failed to set allowed ip: %w", err)
 		}
-		if peer.dummy {
-			return nil
-		}
-		if add {
-			device.allowedips.Insert(prefix, peer.Peer)
-		} else {
-			device.allowedips.Remove(prefix, peer.Peer)
-		}
+		return nil
 
 	case "protocol_version":
 		if value != "1" {

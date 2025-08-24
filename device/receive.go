@@ -13,8 +13,6 @@ import (
 	"time"
 
 	"golang.org/x/crypto/chacha20poly1305"
-	"golang.org/x/net/ipv4"
-	"golang.org/x/net/ipv6"
 	"golang.zx2c4.com/wireguard/conn"
 )
 
@@ -22,11 +20,11 @@ type QueueHandshakeElement struct {
 	msgType  uint32
 	packet   []byte
 	endpoint conn.Endpoint
-	buffer   *[MaxMessageSize]byte
+	buffer   *MessageBuffer
 }
 
 type QueueInboundElement struct {
-	buffer   *[MaxMessageSize]byte
+	buffer   *MessageBuffer
 	packet   []byte
 	counter  uint64
 	keypair  *Keypair
@@ -36,6 +34,11 @@ type QueueInboundElement struct {
 type QueueInboundElementsContainer struct {
 	sync.Mutex
 	elems []*QueueInboundElement
+}
+
+type InboundContainer struct {
+	Buf  *MessageBuffer
+	Peer *Peer
 }
 
 // clearPointers clears elem fields that contain pointers.
@@ -83,7 +86,7 @@ func (device *Device) RoutineReceiveIncoming(maxBatchSize int, recv conn.Receive
 	// receive datagrams until conn is closed
 
 	var (
-		bufsArrs    = make([]*[MaxMessageSize]byte, maxBatchSize)
+		bufsArrs    = make([]*MessageBuffer, maxBatchSize)
 		bufs        = make([][]byte, maxBatchSize)
 		err         error
 		sizes       = make([]int, maxBatchSize)
@@ -95,7 +98,7 @@ func (device *Device) RoutineReceiveIncoming(maxBatchSize int, recv conn.Receive
 
 	for i := range bufsArrs {
 		bufsArrs[i] = device.GetMessageBuffer()
-		bufs[i] = bufsArrs[i][:]
+		bufs[i] = bufsArrs[i].data[:]
 	}
 
 	defer func() {
@@ -133,7 +136,11 @@ func (device *Device) RoutineReceiveIncoming(maxBatchSize int, recv conn.Receive
 
 			// check size of packet
 
-			packet := bufsArrs[i][:size]
+			buf := bufsArrs[i]
+			buf.offset = 0
+			buf.size = size
+
+			packet := buf.data[:size]
 			msgType := binary.LittleEndian.Uint32(packet[:4])
 
 			switch msgType {
@@ -169,7 +176,7 @@ func (device *Device) RoutineReceiveIncoming(maxBatchSize int, recv conn.Receive
 				peer := value.peer
 				elem := device.GetInboundElement()
 				elem.packet = packet
-				elem.buffer = bufsArrs[i]
+				elem.buffer = buf
 				elem.keypair = keypair
 				elem.endpoint = endpoints[i]
 				elem.counter = 0
@@ -182,7 +189,7 @@ func (device *Device) RoutineReceiveIncoming(maxBatchSize int, recv conn.Receive
 				}
 				elemsForPeer.elems = append(elemsForPeer.elems, elem)
 				bufsArrs[i] = device.GetMessageBuffer()
-				bufs[i] = bufsArrs[i][:]
+				bufs[i] = bufsArrs[i].data[:]
 				continue
 
 			// otherwise it is a fixed size & handshake related packet
@@ -210,12 +217,12 @@ func (device *Device) RoutineReceiveIncoming(maxBatchSize int, recv conn.Receive
 			select {
 			case device.queue.handshake.c <- QueueHandshakeElement{
 				msgType:  msgType,
-				buffer:   bufsArrs[i],
+				buffer:   buf,
 				packet:   packet,
 				endpoint: endpoints[i],
 			}:
 				bufsArrs[i] = device.GetMessageBuffer()
-				bufs[i] = bufsArrs[i][:]
+				bufs[i] = bufsArrs[i].data[:]
 			default:
 			}
 		}
@@ -434,7 +441,7 @@ func (peer *Peer) RoutineSequentialReceiver(maxBatchSize int) {
 	}()
 	device.log.Verbosef("%v - Routine: sequential receiver - started", peer)
 
-	bufs := make([][]byte, 0, maxBatchSize)
+	inputs := make([]InboundContainer, 0, maxBatchSize)
 
 	for elemsContainer := range peer.queue.inbound.c {
 		if elemsContainer == nil {
@@ -468,46 +475,20 @@ func (peer *Peer) RoutineSequentialReceiver(maxBatchSize int) {
 			}
 			dataPacketReceived = true
 
-			switch elem.packet[0] >> 4 {
-			case 4:
-				if len(elem.packet) < ipv4.HeaderLen {
-					continue
-				}
-				field := elem.packet[IPv4offsetTotalLength : IPv4offsetTotalLength+2]
-				length := binary.BigEndian.Uint16(field)
-				if int(length) > len(elem.packet) || int(length) < ipv4.HeaderLen {
-					continue
-				}
-				elem.packet = elem.packet[:length]
-				src := elem.packet[IPv4offsetSrc : IPv4offsetSrc+net.IPv4len]
-				if device.allowedips.Lookup(src) != peer {
-					device.log.Verbosef("IPv4 packet with disallowed source address from %v", peer)
-					continue
-				}
+			// Library mode: do not perform IP-layer parsing or allowed-ips checks.
+			// The device operates on raw frames; the decrypted content is treated as a
+			// raw L3 frame and is forwarded as-is to the PacketIO writer.
+			// Any packet validation/routing must be performed by the caller via
+			// outboundSelector or higher-level logic.
 
-			case 6:
-				if len(elem.packet) < ipv6.HeaderLen {
-					continue
-				}
-				field := elem.packet[IPv6offsetPayloadLength : IPv6offsetPayloadLength+2]
-				length := binary.BigEndian.Uint16(field)
-				length += ipv6.HeaderLen
-				if int(length) > len(elem.packet) {
-					continue
-				}
-				elem.packet = elem.packet[:length]
-				src := elem.packet[IPv6offsetSrc : IPv6offsetSrc+net.IPv6len]
-				if device.allowedips.Lookup(src) != peer {
-					device.log.Verbosef("IPv6 packet with disallowed source address from %v", peer)
-					continue
-				}
-
-			default:
-				device.log.Verbosef("Packet with invalid IP version from %v", peer)
-				continue
-			}
-
-			bufs = append(bufs, elem.buffer[:MessageTransportOffsetContent+len(elem.packet)])
+			// FIXME: prevent allocation
+			buf := elem.buffer.Retain()
+			buf.offset = MessageTransportOffsetContent
+			buf.size = len(elem.packet)
+			inputs = append(inputs, InboundContainer{
+				Buf:  buf,
+				Peer: peer,
+			})
 		}
 
 		peer.rxBytes.Add(rxBytesLen)
@@ -520,8 +501,8 @@ func (peer *Peer) RoutineSequentialReceiver(maxBatchSize int) {
 		if dataPacketReceived {
 			peer.timersDataReceived()
 		}
-		if len(bufs) > 0 {
-			_, err := device.tun.device.Write(bufs, MessageTransportOffsetContent)
+		if len(inputs) > 0 {
+			_, err := device.tun.device.Write(inputs)
 			if err != nil && !device.isClosed() {
 				device.log.Errorf("Failed to write packets to TUN device: %v", err)
 			}
@@ -530,7 +511,7 @@ func (peer *Peer) RoutineSequentialReceiver(maxBatchSize int) {
 			device.PutMessageBuffer(elem.buffer)
 			device.PutInboundElement(elem)
 		}
-		bufs = bufs[:0]
+		inputs = inputs[:0]
 		device.PutInboundElementsContainer(elemsContainer)
 	}
 }
